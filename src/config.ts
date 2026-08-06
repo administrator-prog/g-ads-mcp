@@ -9,13 +9,20 @@ import "dotenv/config";
  *   - Ads-critical: only needed once tools are actually invoked. These are
  *     deliberately optional at boot so a fresh deploy can still run the OAuth
  *     flow at /auth to mint the refresh token (chicken-and-egg on first setup).
+ *
+ * MCP_AUTH_TOKEN no longer guards /mcp — the Claude custom-connector UI cannot
+ * send a custom Authorization header. It is still required, because it guards
+ * /auth, which displays a Google refresh token.
  */
 
 export interface Config {
   port: number;
   logLevel: LogLevel;
   nodeEnv: string;
+  /** Guards the OAuth setup flow only. Not used by the MCP endpoint. */
   mcpAuthToken: string;
+  /** Requests per minute per IP allowed on /mcp. 0 disables the limiter. */
+  mcpRateLimitPerMinute: number;
   google: {
     clientId: string;
     clientSecret: string;
@@ -86,11 +93,21 @@ export function loadConfig(): Config {
     throw new Error(`Invalid PORT: ${process.env.PORT}`);
   }
 
+  const rateLimit = Number.parseInt(readEnv("MCP_RATE_LIMIT_PER_MINUTE") ?? "120", 10);
+
+  if (!Number.isInteger(rateLimit) || rateLimit < 0) {
+    throw new Error(
+      `Invalid MCP_RATE_LIMIT_PER_MINUTE: ${process.env.MCP_RATE_LIMIT_PER_MINUTE}. ` +
+        `Expected a non-negative integer (0 disables the limiter).`,
+    );
+  }
+
   return {
     port,
     logLevel: parseLogLevel(readEnv("LOG_LEVEL")),
     nodeEnv: readEnv("NODE_ENV") ?? "production",
     mcpAuthToken: mcpAuthToken!,
+    mcpRateLimitPerMinute: rateLimit,
     google: {
       clientId: clientId!,
       clientSecret: clientSecret!,

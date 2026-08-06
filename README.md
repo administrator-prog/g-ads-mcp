@@ -12,15 +12,30 @@ for minting the Google Ads refresh token during setup.
 
 ## Endpoints
 
-| Method | Path              | Auth                          | Purpose                                            |
-| ------ | ----------------- | ----------------------------- | -------------------------------------------------- |
-| GET    | `/health`         | none                          | Liveness + which config values are present         |
-| GET    | `/auth`           | `?token=<MCP_AUTH_TOKEN>`     | Starts Google OAuth consent                        |
-| GET    | `/oauth2callback` | signed `state` from `/auth`   | Exchanges the code and displays the refresh token  |
-| POST   | `/mcp`            | `Authorization: Bearer <...>` | MCP JSON-RPC endpoint                              |
-| GET    | `/`               | none                          | Endpoint index                                     |
+| Method | Path              | Auth                        | Purpose                                           |
+| ------ | ----------------- | --------------------------- | ------------------------------------------------- |
+| GET    | `/health`         | none                        | Liveness + which config values are present        |
+| GET    | `/auth`           | `?token=<MCP_AUTH_TOKEN>`   | Starts Google OAuth consent                       |
+| GET    | `/oauth2callback` | single-use `state` from `/auth` | Exchanges the code and displays the refresh token |
+| POST   | `/mcp`            | **none**                    | MCP JSON-RPC endpoint                             |
+| GET    | `/`               | none                        | Endpoint index                                    |
 
 `/health` never returns secret values — only booleans indicating whether each variable is set.
+
+> ### ⚠️ The MCP endpoint is unauthenticated
+>
+> `POST /mcp` requires no credentials. **Anyone who knows this server's URL can read every Google
+> Ads account the configured refresh token can reach** — spend, search terms, conversion actions.
+>
+> This is deliberate. The Claude custom connector UI accepts only an OAuth client ID and secret and
+> provides no way to attach a custom `Authorization` header, so a bearer-token gate made the server
+> impossible to add as a connector.
+>
+> `MCP_AUTH_TOKEN` still exists and is still required — it guards `/auth`, which displays a Google
+> refresh token. It no longer has any effect on `/mcp`.
+>
+> See [Hardening a public endpoint](#hardening-a-public-endpoint) for ways to reduce the exposure
+> without breaking connector support.
 
 ---
 
@@ -101,10 +116,11 @@ Set these service variables:
 | `GOOGLE_ADS_CLIENT_ID`         | at boot      | OAuth web client ID                                        |
 | `GOOGLE_ADS_CLIENT_SECRET`     | at boot      | OAuth web client secret                                    |
 | `GOOGLE_REDIRECT_URI`          | at boot      | Must exactly match the URI on the OAuth client             |
-| `MCP_AUTH_TOKEN`               | at boot      | Shared secret, min 24 chars — `openssl rand -hex 32`       |
+| `MCP_AUTH_TOKEN`               | at boot      | Guards `/auth` only, min 24 chars — `openssl rand -hex 32` |
 | `GOOGLE_ADS_DEVELOPER_TOKEN`   | for tools    | From the Google Ads API Center                             |
 | `GOOGLE_ADS_REFRESH_TOKEN`     | for tools    | Produced by step 4 below                                   |
 | `GOOGLE_ADS_LOGIN_CUSTOMER_ID` | for MCC use  | Manager account ID, digits only                            |
+| `MCP_RATE_LIMIT_PER_MINUTE`    | optional     | Per-IP cap on `/mcp`, default `120`, `0` disables          |
 
 The server boots with only the four boot-critical variables set, so you can run the OAuth flow
 before you have a refresh token. Tools return a clear configuration error until the rest are set,
@@ -142,15 +158,31 @@ curl https://g-ads-production.up.railway.app/health
 
 ## Connecting an MCP client
 
+No credentials are needed — just the URL.
+
+### Claude custom connector
+
+**Settings → Connectors → Add custom connector**, then enter:
+
+```
+https://g-ads-production.up.railway.app/mcp
+```
+
+Leave the OAuth **Client ID** and **Client Secret** fields blank. The server does not advertise an
+OAuth authorization server, so the connector attaches directly over Streamable HTTP.
+
+Those fields are for authenticating the connector *to this server*. They are unrelated to
+`GOOGLE_ADS_CLIENT_ID` / `GOOGLE_ADS_CLIENT_SECRET`, which authenticate this server *to Google* and
+belong in Railway's variables. Do not paste your Google credentials into the connector UI.
+
+### Config-file clients
+
 ```json
 {
   "mcpServers": {
     "google-ads": {
       "type": "http",
-      "url": "https://g-ads-production.up.railway.app/mcp",
-      "headers": {
-        "Authorization": "Bearer YOUR_MCP_AUTH_TOKEN"
-      }
+      "url": "https://g-ads-production.up.railway.app/mcp"
     }
   }
 }
@@ -160,8 +192,7 @@ For Claude Code:
 
 ```bash
 claude mcp add --transport http google-ads \
-  https://g-ads-production.up.railway.app/mcp \
-  --header "Authorization: Bearer YOUR_MCP_AUTH_TOKEN"
+  https://g-ads-production.up.railway.app/mcp
 ```
 
 Quick manual check:
@@ -170,7 +201,6 @@ Quick manual check:
 curl -s -X POST https://g-ads-production.up.railway.app/mcp \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
-  -H 'Authorization: Bearer YOUR_MCP_AUTH_TOKEN' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
 ```
 
@@ -239,15 +269,40 @@ field names — v21, for example, replaced `campaign.start_date` with `campaign.
 
 ## Security notes
 
-- Both `/mcp` and `/auth` require `MCP_AUTH_TOKEN`; comparisons are constant-time.
+- **`POST /mcp` is unauthenticated.** Anyone with the URL can read the authorized Google Ads
+  accounts. See the warning under [Endpoints](#endpoints) and the hardening options below.
+- `/auth` still requires `MCP_AUTH_TOKEN`, compared in constant time, because `/oauth2callback`
+  displays a refresh token.
 - OAuth uses single-use, 10-minute, cryptographically random `state` values. Because they live in
   process memory, a redeploy between `/auth` and `/oauth2callback` invalidates the flow — just start
   over. The same applies if you run more than one replica.
 - The refresh token is displayed once and never persisted or logged by this server.
-- `/health` exposes presence booleans only, never values.
+- No Google credential — client secret, developer token, or refresh token — is ever returned by any
+  endpoint. `/health` reports presence booleans only. Tool errors carry Google's own message text
+  and the *names* of missing variables, never their values.
+- Every tool is read-only, which bounds the damage from the open endpoint to disclosure. **Do not
+  add write tools while `/mcp` is unauthenticated** — that would let anonymous callers change live
+  ad spend.
 - No secrets are committed; `.env` is gitignored and `.env.example` contains placeholders only.
-- Adding write tools later would mean revisiting this auth model — a single shared bearer token is a
-  thin guard for mutations against live ad spend.
+
+### Hardening a public endpoint
+
+All of these keep Claude connector compatibility:
+
+1. **Secret URL.** Move the endpoint to an unguessable path (`/mcp/<random>`) and treat the URL as
+   the credential. Connectors accept any URL, so this costs nothing at the client. It is bearer-token
+   security with the token in the path — keep it out of screenshots and logs.
+2. **Rate limiting.** On by default: 120 requests/minute per IP, tunable with
+   `MCP_RATE_LIMIT_PER_MINUTE` (`0` disables). This is a quota and cost backstop, not access control.
+3. **Network restrictions.** Put the service behind Cloudflare Access or a similar reverse proxy that
+   can allow-list by IP or identity ahead of Railway.
+4. **Proper OAuth.** The spec-correct fix is to implement the
+   [MCP authorization spec](https://modelcontextprotocol.io/specification/draft/basic/authorization)
+   so the server acts as an OAuth 2.0 resource server — that is exactly what the connector's Client
+   ID and Client Secret fields are for. It is a real piece of work (metadata discovery, client
+   registration, authorize/token endpoints, PKCE, token validation) and is not implemented here.
+5. **Scope the credentials.** Authorize the refresh token against only the accounts this server
+   needs, rather than a top-level MCC, so an exposed endpoint reveals less.
 
 ---
 

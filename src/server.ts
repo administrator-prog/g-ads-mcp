@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import cors from "cors";
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
+import { rateLimit } from "express-rate-limit";
 
-import { requireBearerToken } from "./auth.js";
 import type { Config } from "./config.js";
 import { errorFields, logger } from "./logger.js";
 import { SERVER_NAME, SERVER_VERSION, createMcpServer } from "./mcp.js";
@@ -15,9 +16,30 @@ export function createApp(config: Config): Express {
   const app = express();
 
   // Railway terminates TLS at its edge, so trust its forwarding headers for
-  // correct req.ip / req.protocol values in logs and redirects.
+  // correct req.ip / req.protocol values in logs and redirects. The rate
+  // limiter depends on this to key on the real client IP rather than the proxy.
   app.set("trust proxy", 1);
   app.disable("x-powered-by");
+
+  // Browser-hosted MCP clients (claude.ai connectors) are subject to CORS.
+  // Nothing here is origin-gated — the MCP endpoint is public either way — so
+  // this only removes a failure mode rather than granting any new access.
+  app.use(
+    cors({
+      origin: "*",
+      methods: ["GET", "POST", "DELETE", "OPTIONS"],
+      allowedHeaders: [
+        "Content-Type",
+        "Accept",
+        "Authorization",
+        "Mcp-Session-Id",
+        "MCP-Protocol-Version",
+        "Last-Event-ID",
+      ],
+      exposedHeaders: ["Mcp-Session-Id", "MCP-Protocol-Version"],
+      maxAge: 86400,
+    }),
+  );
 
   app.use(express.json({ limit: JSON_BODY_LIMIT }));
 
@@ -51,6 +73,10 @@ export function createApp(config: Config): Express {
       service: SERVER_NAME,
       version: SERVER_VERSION,
       uptimeSeconds: Math.round(process.uptime()),
+      // Stated plainly so the exposure is visible from the outside rather than
+      // buried in config, and so connector setup is easy to verify.
+      mcpAuth: "none",
+      mcpRateLimitPerMinute: config.mcpRateLimitPerMinute,
       configured: {
         clientId: Boolean(google.clientId),
         clientSecret: Boolean(google.clientSecret),
@@ -58,7 +84,8 @@ export function createApp(config: Config): Express {
         loginCustomerId: Boolean(google.loginCustomerId),
         refreshToken: Boolean(google.refreshToken),
         redirectUri: Boolean(google.redirectUri),
-        mcpAuthToken: Boolean(config.mcpAuthToken),
+        // Guards the OAuth setup flow only; the MCP endpoint is open.
+        setupToken: Boolean(config.mcpAuthToken),
       },
       ...(ready
         ? {}
@@ -74,9 +101,29 @@ export function createApp(config: Config): Express {
   app.use(createOAuthRouter(config));
 
   // --- MCP ----------------------------------------------------------------
-  const mcpGuard = requireBearerToken(config);
+  // Deliberately unauthenticated. The Claude custom connector UI supports only
+  // an OAuth client ID and secret, with no way to attach a custom Authorization
+  // header, so requiring a bearer token here made the server unusable as a
+  // connector. Anyone who knows this URL can read the authorized Google Ads
+  // accounts; the rate limiter below is a quota backstop, not access control.
+  const mcpMiddleware =
+    config.mcpRateLimitPerMinute > 0
+      ? [
+          rateLimit({
+            windowMs: 60_000,
+            limit: config.mcpRateLimitPerMinute,
+            standardHeaders: "draft-7",
+            legacyHeaders: false,
+            message: {
+              jsonrpc: "2.0",
+              id: null,
+              error: { code: -32029, message: "Rate limit exceeded. Try again shortly." },
+            },
+          }),
+        ]
+      : [];
 
-  app.post("/mcp", mcpGuard, async (req: Request, res: Response) => {
+  app.post("/mcp", ...mcpMiddleware, async (req: Request, res: Response) => {
     // Stateless mode: a new server + transport per request means no session
     // affinity is required and a redeploy cannot orphan in-flight sessions.
     const server = createMcpServer(config);
@@ -118,8 +165,8 @@ export function createApp(config: Config): Express {
     });
   };
 
-  app.get("/mcp", mcpGuard, methodNotAllowed);
-  app.delete("/mcp", mcpGuard, methodNotAllowed);
+  app.get("/mcp", methodNotAllowed);
+  app.delete("/mcp", methodNotAllowed);
 
   // --- Root ---------------------------------------------------------------
   app.get("/", (_req, res) => {
@@ -131,7 +178,7 @@ export function createApp(config: Config): Express {
         health: "GET /health",
         auth: "GET /auth?token=<MCP_AUTH_TOKEN>",
         oauthCallback: "GET /oauth2callback",
-        mcp: "POST /mcp (Authorization: Bearer <MCP_AUTH_TOKEN>)",
+        mcp: "POST /mcp (no authentication)",
       },
     });
   });

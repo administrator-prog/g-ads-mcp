@@ -1,7 +1,17 @@
 import { timingSafeEqual } from "node:crypto";
-import type { NextFunction, Request, Response } from "express";
+import type { Request } from "express";
 
 import type { Config } from "./config.js";
+
+/**
+ * Authorization for the OAuth setup flow.
+ *
+ * The MCP endpoint itself is intentionally unauthenticated: the Claude custom
+ * connector UI accepts only an OAuth client ID and secret, with no way to send
+ * a custom Authorization header, so a bearer gate there makes the server
+ * unusable as a connector. The setup flow keeps its gate because
+ * /oauth2callback displays a Google Ads refresh token.
+ */
 
 /** Constant-time comparison that does not leak length via early return. */
 export function secretEquals(a: string, b: string): boolean {
@@ -17,7 +27,7 @@ export function secretEquals(a: string, b: string): boolean {
 
 /**
  * Extracts the presented secret from either an `Authorization: Bearer <token>`
- * header (preferred, and what MCP clients send) or an `X-MCP-Auth` header.
+ * header or an `X-MCP-Auth` header.
  */
 function presentedToken(req: Request): string | undefined {
   const authorization = req.get("authorization");
@@ -27,33 +37,6 @@ function presentedToken(req: Request): string | undefined {
   }
   const custom = req.get("x-mcp-auth");
   return custom ? custom.trim() : undefined;
-}
-
-/**
- * Bearer-token gate for the MCP endpoint. Responds with a JSON-RPC shaped error
- * so MCP clients surface something intelligible rather than raw HTML.
- */
-export function requireBearerToken(config: Config) {
-  return function bearerGuard(req: Request, res: Response, next: NextFunction): void {
-    const token = presentedToken(req);
-
-    if (!token || !secretEquals(token, config.mcpAuthToken)) {
-      res
-        .status(401)
-        .set("WWW-Authenticate", 'Bearer realm="google-ads-mcp"')
-        .json({
-          jsonrpc: "2.0",
-          id: null,
-          error: {
-            code: -32001,
-            message: "Unauthorized: a valid Authorization: Bearer <MCP_AUTH_TOKEN> header is required.",
-          },
-        });
-      return;
-    }
-
-    next();
-  };
 }
 
 /**
