@@ -78,6 +78,22 @@ enough for reporting; *Test Account* tokens only work against test accounts.
 Point a Railway service at this repository. `railway.json` sets the build command, start command,
 and a `/health` healthcheck; Railway injects `PORT` automatically.
 
+Nixpacks runs three phases, and `railway.json` must not duplicate any of them:
+
+| Phase   | Command         | Comes from                                        |
+| ------- | --------------- | ------------------------------------------------- |
+| install | `npm ci`        | Nixpacks default, because `package-lock.json` exists |
+| build   | `npm run build` | `railway.json` → `build.buildCommand`             |
+| start   | `npm run start` | `railway.json` → `deploy.startCommand`            |
+
+Do not put `npm ci` in `buildCommand`. Running it twice makes the second pass try to remove a
+`node_modules/.cache` directory the first pass still holds open, and the build fails with
+`EBUSY: resource busy or locked, rmdir '/app/node_modules/.cache'`.
+
+Node is pinned to 20 by `engines.node` (`20.x`) in `package.json`, with `.nvmrc` matching. Nixpacks
+reads `engines.node` first; an open range like `>=20.0.0` lets it select the newest available Node
+instead. `@types/node` is held on `^20` so the types match the runtime.
+
 Set these service variables:
 
 | Variable                       | Required     | Notes                                                     |
@@ -173,6 +189,9 @@ npm run typecheck         # tsc --noEmit
 npm run build             # compile to dist/
 npm start                 # run the compiled server
 ```
+
+Use Node 20 locally to match production (`nvm use` picks it up from `.nvmrc`). Newer Node still
+works, but npm will warn `EBADENGINE` against the pinned `engines.node`.
 
 For local OAuth, add `http://localhost:8080/oauth2callback` as a second authorized redirect URI on
 the OAuth client and set `GOOGLE_REDIRECT_URI` to match.
