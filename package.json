@@ -2,7 +2,7 @@
   "name": "g-ads-mcp",
   "version": "1.0.0",
   "private": true,
-  "description": "Read-only Google Ads MCP server over Streamable HTTP, deployable to Railway.",
+  "description": "Google Ads MCP server over Streamable HTTP with its own OAuth and guarded write tools, deployable to Railway.",
   "type": "module",
   "engines": {
     "node": "20.x"
@@ -13,6 +13,7 @@
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test test/*.test.ts",
     "clean": "rm -rf dist"
   },
   "dependencies": {

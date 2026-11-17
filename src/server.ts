@@ -1,12 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import cors from "cors";
-import express, { type Express, type NextFunction, type Request, type Response } from "express";
+import express, { type Express, type NextFunction, type Request, type RequestHandler, type Response } from "express";
 import { rateLimit } from "express-rate-limit";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import { getOAuthProtectedResourceMetadataUrl, mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
 
 import type { Config } from "./config.js";
 import { errorFields, logger } from "./logger.js";
 import { SERVER_NAME, SERVER_VERSION, createMcpServer } from "./mcp.js";
+import { createConsentRouter, McpOAuthProvider } from "./mcp-oauth.js";
 import { createOAuthRouter } from "./oauth.js";
 
 /** Request bodies are small JSON-RPC envelopes; cap them well below any abuse. */
@@ -73,9 +76,9 @@ export function createApp(config: Config): Express {
       service: SERVER_NAME,
       version: SERVER_VERSION,
       uptimeSeconds: Math.round(process.uptime()),
-      // Stated plainly so the exposure is visible from the outside rather than
-      // buried in config, and so connector setup is easy to verify.
-      mcpAuth: "none",
+      // Stated plainly so the auth state is visible from outside.
+      mcpAuth: config.mcpOAuth ? "oauth" : "not-configured (all /mcp requests refused)",
+      writeAccounts: config.writeAccounts.size,
       mcpRateLimitPerMinute: config.mcpRateLimitPerMinute,
       configured: {
         clientId: Boolean(google.clientId),
@@ -84,8 +87,9 @@ export function createApp(config: Config): Express {
         loginCustomerId: Boolean(google.loginCustomerId),
         refreshToken: Boolean(google.refreshToken),
         redirectUri: Boolean(google.redirectUri),
-        // Guards the OAuth setup flow only; the MCP endpoint is open.
+        // Guards /auth and is the MCP consent password.
         setupToken: Boolean(config.mcpAuthToken),
+        mcpOAuth: Boolean(config.mcpOAuth),
       },
       ...(ready
         ? {}
@@ -100,12 +104,33 @@ export function createApp(config: Config): Express {
   // --- OAuth setup flow ---------------------------------------------------
   app.use(createOAuthRouter(config));
 
+  // --- MCP authorization -------------------------------------------------
+  // /mcp needs a bearer token issued by this server's own OAuth server
+  // (src/mcp-oauth.ts). Without the MCP_OAUTH_* variables it refuses every
+  // request: the endpoint never falls back to being open.
+  const mcpUrl = new URL("/mcp", config.publicBaseUrl);
+  let mcpAuth: RequestHandler;
+  if (config.mcpOAuth) {
+    const provider = new McpOAuthProvider(config.mcpOAuth, config.mcpAuthToken);
+    app.use(
+      mcpAuthRouter({
+        provider,
+        issuerUrl: new URL(config.publicBaseUrl),
+        resourceServerUrl: mcpUrl,
+        resourceName: "Google Ads MCP",
+      }),
+    );
+    app.use(createConsentRouter(provider));
+    mcpAuth = requireBearerAuth({ verifier: provider, resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(mcpUrl) });
+  } else {
+    logger.warn("MCP OAuth is not configured: /mcp will refuse every request");
+    mcpAuth = (_req, res) => {
+      res.status(503).json({ jsonrpc: "2.0", id: null, error: { code: -32001, message: "MCP authorization is not configured on this server." } });
+    };
+  }
+
   // --- MCP ----------------------------------------------------------------
-  // Deliberately unauthenticated. The Claude custom connector UI supports only
-  // an OAuth client ID and secret, with no way to attach a custom Authorization
-  // header, so requiring a bearer token here made the server unusable as a
-  // connector. Anyone who knows this URL can read the authorized Google Ads
-  // accounts; the rate limiter below is a quota backstop, not access control.
+  // The rate limiter is a quota backstop for a paid API, not access control.
   const mcpMiddleware =
     config.mcpRateLimitPerMinute > 0
       ? [
@@ -123,7 +148,7 @@ export function createApp(config: Config): Express {
         ]
       : [];
 
-  app.post("/mcp", ...mcpMiddleware, async (req: Request, res: Response) => {
+  app.post("/mcp", ...mcpMiddleware, mcpAuth, async (req: Request, res: Response) => {
     // Stateless mode: a new server + transport per request means no session
     // affinity is required and a redeploy cannot orphan in-flight sessions.
     const server = createMcpServer(config);
@@ -173,12 +198,13 @@ export function createApp(config: Config): Express {
     res.json({
       service: SERVER_NAME,
       version: SERVER_VERSION,
-      description: "Read-only Google Ads MCP server.",
+      description: "Google Ads MCP server (OAuth-protected; writes limited to allow-listed accounts).",
       endpoints: {
         health: "GET /health",
         auth: "GET /auth?token=<MCP_AUTH_TOKEN>",
         oauthCallback: "GET /oauth2callback",
-        mcp: "POST /mcp (no authentication)",
+        mcp: "POST /mcp (OAuth bearer token)",
+        oauthMetadata: "GET /.well-known/oauth-authorization-server",
       },
     });
   });

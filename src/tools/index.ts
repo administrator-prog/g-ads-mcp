@@ -9,13 +9,12 @@ import { registerGetConversionActions } from "./get-conversion-actions.js";
 import { registerGetSearchTerms } from "./get-search-terms.js";
 import { registerListAccessibleCustomers } from "./list-accessible-customers.js";
 import { registerListClientAccounts } from "./list-client-accounts.js";
+import { registerWriteTools } from "./write-tools.js";
 
 /**
- * Registers the full tool set.
- *
- * Every tool here is read-only. There are deliberately no mutate/create/update
- * tools — adding one would also require revisiting the auth model, since a
- * single shared bearer token is a thin guard for write access.
+ * Registers the full tool set: the read-only reporting tools, plus the write
+ * tools (src/tools/write-tools.ts). Writes are only possible because /mcp is
+ * now behind OAuth, and only on accounts in GOOGLE_ADS_WRITE_ACCOUNTS.
  */
 export function registerTools(server: McpServer, config: Config): void {
   registerListAccessibleCustomers(server, config);
@@ -25,4 +24,5 @@ export function registerTools(server: McpServer, config: Config): void {
   registerGetCampaignPerformance(server, config);
   registerGetSearchTerms(server, config);
   registerGetConversionActions(server, config);
+  registerWriteTools(server, config);
 }
