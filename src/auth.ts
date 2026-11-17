@@ -4,13 +4,8 @@ import type { Request } from "express";
 import type { Config } from "./config.js";
 
 /**
- * Authorization for the OAuth setup flow.
- *
- * The MCP endpoint itself is intentionally unauthenticated: the Claude custom
- * connector UI accepts only an OAuth client ID and secret, with no way to send
- * a custom Authorization header, so a bearer gate there makes the server
- * unusable as a connector. The setup flow keeps its gate because
- * /oauth2callback displays a Google Ads refresh token.
+ * Authorization for the Google OAuth setup flow (/auth), which displays a
+ * Google Ads refresh token. /mcp has its own OAuth server: src/mcp-oauth.ts.
  */
 
 /** Constant-time comparison that does not leak length via early return. */

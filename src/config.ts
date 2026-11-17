@@ -10,17 +10,37 @@ import "dotenv/config";
  *     deliberately optional at boot so a fresh deploy can still run the OAuth
  *     flow at /auth to mint the refresh token (chicken-and-egg on first setup).
  *
- * MCP_AUTH_TOKEN no longer guards /mcp — the Claude custom-connector UI cannot
- * send a custom Authorization header. It is still required, because it guards
- * /auth, which displays a Google refresh token.
+ * /mcp is protected by this server's own OAuth 2.1 authorization server
+ * (src/mcp-oauth.ts): Claude's custom-connector UI takes an OAuth client ID and
+ * secret, and the owner approves the connection once with MCP_AUTH_TOKEN. With
+ * the OAuth variables unset, /mcp refuses every request (fails closed).
+ * MCP_AUTH_TOKEN also still guards /auth, which displays a Google refresh token.
  */
 
 export interface Config {
   port: number;
   logLevel: LogLevel;
   nodeEnv: string;
-  /** Guards the OAuth setup flow only. Not used by the MCP endpoint. */
+  /** Guards /auth (Google consent) and is the password on the MCP consent page. */
   mcpAuthToken: string;
+  /** Public origin of this server, e.g. https://g-ads-production.up.railway.app */
+  publicBaseUrl: string;
+  /** OAuth for /mcp. Undefined when not configured: /mcp then refuses everything. */
+  mcpOAuth:
+    | {
+        clientId: string;
+        clientSecret: string;
+        signingSecret: string;
+        redirectUris: string[];
+        accessTokenTtlSeconds: number;
+        refreshTokenTtlSeconds: number;
+      }
+    | undefined;
+  /**
+   * Accounts write tools may change, with each account's monthly spend cap in
+   * the account's own currency. Any account not listed is read-only.
+   */
+  writeAccounts: Map<string, { monthlyCap: number }>;
   /** Requests per minute per IP allowed on /mcp. 0 disables the limiter. */
   mcpRateLimitPerMinute: number;
   google: {
@@ -102,8 +122,43 @@ export function loadConfig(): Config {
     );
   }
 
+  const publicBaseUrl = (readEnv("PUBLIC_BASE_URL") ?? new URL(redirectUri!).origin).replace(/\/$/, "");
+
+  const oauthClientId = readEnv("MCP_OAUTH_CLIENT_ID");
+  const oauthClientSecret = readEnv("MCP_OAUTH_CLIENT_SECRET");
+  const oauthSigningSecret = readEnv("MCP_OAUTH_SIGNING_SECRET");
+  let mcpOAuth: Config["mcpOAuth"];
+  if (oauthClientId || oauthClientSecret || oauthSigningSecret) {
+    const missingOAuth = [
+      ["MCP_OAUTH_CLIENT_ID", oauthClientId],
+      ["MCP_OAUTH_CLIENT_SECRET", oauthClientSecret],
+      ["MCP_OAUTH_SIGNING_SECRET", oauthSigningSecret],
+    ].filter(([, v]) => !v).map(([k]) => k);
+    if (missingOAuth.length > 0) {
+      throw new Error(`Incomplete MCP OAuth configuration. Missing: ${missingOAuth.join(", ")}.`);
+    }
+    for (const [name, value] of [["MCP_OAUTH_CLIENT_SECRET", oauthClientSecret], ["MCP_OAUTH_SIGNING_SECRET", oauthSigningSecret]] as const) {
+      if (value!.length < 32) {
+        throw new Error(`${name} must be at least 32 characters. Generate one with: openssl rand -hex 32`);
+      }
+    }
+    mcpOAuth = {
+      clientId: oauthClientId!,
+      clientSecret: oauthClientSecret!,
+      signingSecret: oauthSigningSecret!,
+      redirectUris: (readEnv("MCP_OAUTH_REDIRECT_URIS") ??
+        "https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback")
+        .split(",").map((u) => u.trim()).filter(Boolean),
+      accessTokenTtlSeconds: 3600,
+      refreshTokenTtlSeconds: 30 * 24 * 3600,
+    };
+  }
+
   return {
     port,
+    publicBaseUrl,
+    mcpOAuth,
+    writeAccounts: parseWriteAccounts(readEnv("GOOGLE_ADS_WRITE_ACCOUNTS")),
     logLevel: parseLogLevel(readEnv("LOG_LEVEL")),
     nodeEnv: readEnv("NODE_ENV") ?? "production",
     mcpAuthToken: mcpAuthToken!,
@@ -119,4 +174,26 @@ export function loadConfig(): Config {
       refreshToken: readEnv("GOOGLE_ADS_REFRESH_TOKEN"),
     },
   };
+}
+
+/**
+ * GOOGLE_ADS_WRITE_ACCOUNTS: comma-separated "customerId:monthlyCap" pairs, the
+ * cap in the account's own currency, e.g. "937-504-8103:400". Every account not
+ * listed stays read-only, whatever the caller asks.
+ */
+export function parseWriteAccounts(raw: string | undefined): Map<string, { monthlyCap: number }> {
+  const accounts = new Map<string, { monthlyCap: number }>();
+  if (!raw) return accounts;
+  for (const entry of raw.split(",").map((e) => e.trim()).filter(Boolean)) {
+    const [idPart, capPart] = entry.split(":");
+    const id = normalizeCustomerId(idPart ?? "");
+    const cap = Number(capPart);
+    if (id.length < 7 || !Number.isFinite(cap) || cap <= 0) {
+      throw new Error(
+        `Invalid GOOGLE_ADS_WRITE_ACCOUNTS entry "${entry}". Expected customerId:monthlyCap, e.g. 937-504-8103:400.`,
+      );
+    }
+    accounts.set(id, { monthlyCap: cap });
+  }
+  return accounts;
 }
