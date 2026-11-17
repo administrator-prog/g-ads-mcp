@@ -10,6 +10,7 @@ import { registerGetSearchTerms } from "./get-search-terms.js";
 import { registerListAccessibleCustomers } from "./list-accessible-customers.js";
 import { registerListClientAccounts } from "./list-client-accounts.js";
 import { registerWriteTools } from "./write-tools.js";
+import { registerExtraTools } from "./extra-tools.js";
 
 /**
  * Registers the full tool set: the read-only reporting tools, plus the write
@@ -25,4 +26,5 @@ export function registerTools(server: McpServer, config: Config): void {
   registerGetSearchTerms(server, config);
   registerGetConversionActions(server, config);
   registerWriteTools(server, config);
+  registerExtraTools(server, config);
 }

@@ -89,8 +89,8 @@ export class GoogleAdsClient {
   }
 
   /**
-   * Runs a GAQL query. Queries are always assembled in this codebase from
-   * validated inputs — no caller-supplied GAQL is ever executed.
+   * Runs a GAQL query. Queries are assembled in this codebase from validated
+   * inputs, except run_query, which accepts a caller's SELECT (read-only).
    */
   async query(customerId: string, gaql: string): Promise<AdsRow[]> {
     const id = assertCustomerId(customerId);
